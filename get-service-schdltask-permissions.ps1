@@ -18,8 +18,8 @@ function Write-Log {
                     Param(
                             [Parameter(ValueFromPipeline=$true,Mandatory=$true)] [ValidateNotNullOrEmpty()]
                             [string] $Message,
-                            [Parameter()] [ValidateSet(“Error”, “Warn”, “Info”)]
-                            [string] $Level = “Info”,
+                            [Parameter()] [ValidateSet(â€œErrorâ€, â€œWarnâ€, â€œInfoâ€)]
+                            [string] $Level = â€œInfoâ€,
                             [Parameter()]
                             [Switch] $NoConsoleOut,
                             [Parameter()]
@@ -43,7 +43,7 @@ function Write-Log {
             Begin {}
             Process {
                     try {                  
-                            $msg = '{0}{1} : {2} : {3}' -f (" " * $Indent), (Get-Date -Format “yyyy-MM-dd HH:mm:ss”), $Level.ToUpper(), $Message                           
+                            $msg = '{0}{1} : {2} : {3}' -f (" " * $Indent), (Get-Date -Format â€œyyyy-MM-dd HH:mm:ssâ€), $Level.ToUpper(), $Message                           
                             if ($NoConsoleOut -eq $false) {
                                     switch ($Level) {
                                             'Error' { Write-Error $Message }
@@ -69,13 +69,13 @@ function Write-Log {
                                 $log.set_log($EventLogName)  
                                 $log.set_source($EventSource)                       
                                     switch ($Level) {
-                                            “Error” { $log.WriteEntry($Message, 'Error', $EventID) }
-                                            “Warn”  { $log.WriteEntry($Message, 'Warning', $EventID) }
-                                            “Info”  { $log.WriteEntry($Message, 'Information', $EventID) }
+                                            â€œErrorâ€ { $log.WriteEntry($Message, 'Error', $EventID) }
+                                            â€œWarnâ€  { $log.WriteEntry($Message, 'Warning', $EventID) }
+                                            â€œInfoâ€  { $log.WriteEntry($Message, 'Information', $EventID) }
                                     }
                             }
                     } catch {
-                            throw “Failed to create log entry in: ‘$Path’. The error was: ‘$_’.”
+                            throw â€œFailed to create log entry in: â€˜$Pathâ€™. The error was: â€˜$_â€™.â€
                     }
             }    
             End {}    
