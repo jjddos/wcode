@@ -2,11 +2,12 @@
 Import-Module ServerManager
 
 #Define vars for log path, server details, directory paths and file filters for import
-$LogPath = "C:\CMS\Get-WindowsServices.log"
+$LogPath = "C:\CMS\Get-WindowsServices_Tasks.log"
 [string] $CMSServer = "SGP1PCNCMSSRV01"
 [string] $Centraldb = "CentralDB"
 $ImportDirectoryName = "C:\CMS\Import\"
 $fileFilter = "WindowsServices_*.csv"
+$fileTaskFilter = "WindowsTasks_*.csv"
 $OutputDirectoryName = "C:\CMS\Output\ServicesInfo"
 $cmsInventoryFile = "C:\CMS\Output\Svr.Inventory_$($env:computername).csv" 
 $currentTime = Get-Date -Format ddMMMyyyy-HHmm
@@ -160,7 +161,7 @@ function Sanitize-SQLInput([string]$inputValue){
 
     $inputValue = $inputValue -replace "'","''"
 
-    $nonsecureKeywords = @('SELECT', 'INSERT', 'DROP', 'UPDATE', 'DELETE', 'EXEC', '--', ';')
+    $nonsecureKeywords = @('SELECT', 'INSERT', 'DROP', 'UPDATE', 'DELETE', 'EXEC', '--', ';', '\$', '@')
     foreach($keyword in $nonsecureKeywords){
         $inputValue = $inputValue -replace $keyword,""
     }
@@ -173,7 +174,7 @@ Write-Log -Message "Script Started at $(Get-Date)  " -NoConsoleOut -Clobber -Pat
 $ScriptBlock = { 
 $resultTask = @()
 $resultService = @()
-$LogPath = "C:\CMS\Get-WindowsServices.log"
+$LogPath = "C:\CMS\Get-WindowsServices_Tasks.log"
 
 #checks the format of service image paths
 function Test-ImagePath($path)
@@ -223,7 +224,7 @@ function get-Permissions($path, $groupsToCheck, $isFile) {
 #corrects the file paths by replacing systemroot, adding C:windows, removing \??\
 function Check-BinaryPath($path)
 {
-    $defaultSystemRoot = $env:SystemRoot+'\\'
+    $defaultSystemRoot = $env:SystemRoot+'\'
     $path = $path -replace '^\\\?\?\\','' -replace '%windir%','\systemroot' -replace '%systemroot%','\systemroot'
     if($path -match '^\\systemroot\\'){
         $path = $path -replace '^\\systemroot\\', $defaultSystemRoot
@@ -233,6 +234,16 @@ function Check-BinaryPath($path)
         $path = $defaultSystemRoot + $path
     }
     
+    $regexPlaceholder = '%([^%]+)%'
+    foreach($match in [regex]::Matches($path,$regexPlaceholder)){
+        $envar = $match.Groups[1].Value
+        $envalue = [environment]::GetEnvironmentVariable($envar)
+        if($envalue){
+            $path = $path -replace "%$envar%", $envalue
+        }
+    }
+    
+
     return $path
 }
 
@@ -248,15 +259,18 @@ $reg = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey('LocalMachine',$env:COMP
 $regkey = $reg.OpenSubKey('SYSTEM\CurrentControlSet\Services')
 $services = $regkey.GetSubKeyNames()
 
-$schldTasks = Get-ScheduledTask
+$schldTasks = Get-ScheduledTask 
 
 #iteration for each scheduled task
-    foreach($task in $schldTasks)
+foreach($task in $schldTasks)
+{
+    :get foreach($action in $task.Actions)
     {
-        $sctaskObject = "" | select Domain,Computer,TaskName,State,Executable,ExecPass,FolderPass,AllPass,Comments
+        $sctaskObject = "" | select Domain,Computer,TaskName,Description,State,Executable,ExecPass,FolderPass,AllPass,Comments
         $sctaskObject.TaskName = $task.TaskName
         $sctaskObject.State = $task.State
-       # $sctaskObject.Executable = $task.Actions.Execute
+        $sctaskObject.Description = $task.Description
+        #$sctaskObject.Executable = $task.Actions.Execute
         $sctaskObject.AllPass = 1
         $sctaskObject.Computer = $env:COMPUTERNAME
         $sctaskObject.Domain = $env:USERDOMAIN
@@ -268,11 +282,10 @@ $schldTasks = Get-ScheduledTask
         $psfailedFolders = @()
         $psComments = @()
         $psFailPath = @()
-        :get foreach($action in $task.Actions)
-        {
-            $taskexe = $action.Execute
+        $psPaths = @()
+        $taskexe = $action.Execute
 
-            if([string]::IsNullOrEmpty($taskexe)){
+        if([string]::IsNullOrEmpty($taskexe)){
                 $sctaskObject.Comments = "Scheduled task has null executable path" 
                 $sctaskObject.AllPass = "NA"
                 $sctaskObject.ExecPass = "NA"
@@ -281,25 +294,28 @@ $schldTasks = Get-ScheduledTask
                 continue get
             }
 
-            $taskexecPath= Check-BinaryPath -path $taskexe
-            $taskexeFilename = [System.IO.Path]::GetFileName(($taskexecPath))
+        $taskexecPaths = Check-BinaryPath -path $taskexe.Replace('"','')
+        $taskexeFilename = [System.IO.Path]::GetFileName(($taskexecPaths))
 
-            if($taskexecPath -eq $taskexeFilename){
-                $taskexecPath = where.exe $taskexecPath
+        if($taskexecPaths -eq $taskexeFilename){
+            $taskexecPaths = where.exe $taskexecPaths
+        }
+        $sctaskObject.Executable = $taskexecPaths
+        foreach($taskexecPath  in $taskexecPaths){
+        if(Test-Path $taskexecPath){
+            $taskexecFolder = [System.IO.Path]::GetDirectoryName($taskexecPath)
+            if(($exeToCheck -contains $taskexeFilename) -and $action.Arguments)
+            {
+                $psPaths = $action.Arguments -split ' ' | Where-Object {$_.EndsWith('.ps1')}
+                $psComments += "Scheduled task has action to start powershell. $($action.Arguments)"
             }
+            foreach($groupname in $groupsToCheck){
+                $result = get-Permissions -path $taskexecPath -groupsToCheck $groupname -isFile $true
+                $folderResult = get-Permissions -path $taskexecFolder -groupsToCheck $groupname -isFile $false
 
-            if(Test-Path $taskexecPath){
-                $taskexecFolder = [System.IO.Path]::GetDirectoryName($taskexecPath)
-                if(($exeToCheck -contains $taskexeFilename) -and $action.Arguments){
-                        $psPaths = $action.Arguments -split ' ' | Where-Object {$_.EndsWith('.ps1')}
-                        $psComments += "Scheduled task has action to start powershell. $($action.Arguments)"
-                }
-                foreach($groupname in $groupsToCheck){
-                    $result = get-Permissions -path $taskexecPath -groupsToCheck $groupname -isFile $true
-                    $folderResult = get-Permissions -path $taskexecFolder -groupsToCheck $groupname -isFile $false
-
-                    foreach($pspath in $psPaths)
-                    {
+                foreach($pspath in $psPaths)
+                {
+                    if($pspath -like ".\*"){$pspath = Join-Path $action.WorkingDirectory $pspath.TrimStart(".\")}
                         if(Test-Path $pspath){
                             $psFolder = [System.IO.Path]::GetDirectoryName($pspath)
                             $psresult = get-Permissions -path $pspath -groupsToCheck $groupname -isFile $true
@@ -321,34 +337,36 @@ $schldTasks = Get-ScheduledTask
                         }
                     }
 
-                    if(-not $folderResult){
-                        $sctaskObject.AllPass = 0
-                        $failedFolders += $groupname 
-                    }
-                    if(-not $result){
-                        $failedGroups += $groupname
-                        $sctaskObject.AllPass = 0 
-                    }
+                if(-not $folderResult){
+                    $sctaskObject.AllPass = 0
+                    $failedFolders += $groupname 
+                }
+                if(-not $result){
+                    $failedGroups += $groupname
+                    $sctaskObject.AllPass = 0 
                 }
             }
-            else{
-                $sctaskObject.AllPass = 0
-                $sctaskObject.Comments = "The specfied path ''$taskexecPath'' does not exist. Please check the path."
-            }
+        }
+        else{
+            $sctaskObject.AllPass = 0
+            $sctaskObject.Comments = "The specfied path ''$taskexecPath'' does not exist. Please check the path."
+        }
         }
 
         $sctaskObject.ExecPass = [int](-not ($psfailedGroups.Count + $failedGroups.Count))
         $sctaskObject.FolderPass = [int](-not ($psfailedFolders.Count + $failedFolders.Count))
         
-        $psComments += ($psFailPath.Count -gt 0),"" -ne "The specfied path $($psFailPath | Select-Object -Unique | ForEach-Object { $_ -join ', '}) does not exist. Please check the path."
+        #$psComments += ($psFailPath.Count -gt 0),"" -ne "The specfied path $($psFailPath | Select-Object -Unique | ForEach-Object { $_ -join ', '}) does not exist. Please check the path."
+        $psComments += @("","`nThe specfied path $($psFailPath | Select-Object -Unique | ForEach-Object { $_ -join ', '}) does not exist. Please check the path.")[$psFailPath.Count -gt 0]
         if(-not $sctaskObject.ExecPass -or -not $sctaskObject.FolderPass){
-            if([int](-not ($failedGroups.Count + $failedFolders.Count)) -gt 0) {$sctaskObject.Comments = "Groups not passed: $($failedGroups -join ', '), Folders not passed: $($failedFolders -join ', ')"}
-            if([int](-not ($psfailedGroups.Count + $psfailedFolders.Count)) -gt 0){
-            $psComments += "Groups not passed for arguments: $($psfailedGroups -join ', '), Folders not passed for arguments: $($psfailedFolders -join ', ')"
-            }
+            if(($failedGroups.Count + $failedFolders.Count) -gt 0) {$sctaskObject.Comments = "Groups not passed: $($failedGroups -join ', '), Folders not passed: $($failedFolders -join ', ')"}
+            if(($psfailedGroups.Count + $psfailedFolders.Count) -gt 0) {$psComments += "`nGroups not passed for arguments: $($psfailedGroups -join ', '), Folders not passed for arguments: $($psfailedFolders -join ', ')"}
         }
         $sctaskObject.Comments += $psComments
         $resultTask += $sctaskObject
+    }
+
+        
     }
 
 #iteration for each service located in registry to check path permissions
@@ -448,7 +466,7 @@ try {
     }
     else {
         Write-Log -Message "Running the query to get Inventory..." -NoConsoleOut -Path $LogPath
-        $querys = "SELECT Name FROM [CentralDB].[Svr].[Inventory] WHERE [Active]=1 AND [Domain]='SGPCN.LOCAL' and name='SGP1PCNCMSSRV01'"
+        $querys = "SELECT Name FROM [CentralDB].[Svr].[Inventory] WHERE [Active]=1 AND [Domain]='SGPCN.LOCAL'"
         $inventory = Invoke-Sqlcmd -ServerInstance $CMSServer -Database $env:CentralDB -Query $querys
         $colComputers = $inventory.Name
     }
@@ -474,11 +492,22 @@ catch {
 $servicesScan  = Run-Jobs $colComputers $Scriptblock
 
 try {
-if($CMSServer -ne $env:COMPUTERNAME){
+if($CMSServer -eq $env:COMPUTERNAME){
      #Export $returnValue into C:\CMS\Import with name starting as WindowsServices_
-    $servicesScan | Export-Csv -Path "C:\CMS\Import\WindowsServices_$($env:USERDOMAIN).csv" -Force -notypeinformation -Append
-    Write-Log -Message "Service info file has been exported to the output folder" -NoConsoleOut -Path $LogPath
-   
+        $filepath ="C:\CMS\Import\WindowsTasks_$($env:USERDOMAIN).csv"
+        if(Test-Path -path $filepath){ Remove-Item -path $filepath -Force }
+        $servicesScan.resultTask | Export-Csv -Path $filepath -Force -notypeinformation -Append
+        Write-Log -Message "Scheduled Tasks info have been exported to the output folder" -NoConsoleOut -Path $LogPath
+
+        $filepath ="C:\CMS\Import\WindowsServices_$($env:USERDOMAIN).csv"
+        if(Test-Path -path $filepath){ Remove-Item -path $filepath -Force }
+        $servicesScan.resultService | Export-Csv -Path $filepath -Force -notypeinformation -Append
+        Write-Log -Message "Services info have been exported to the output folder" -NoConsoleOut -Path $LogPath
+
+
+
+  #------------------------*WindowsServices*--------------------------------------------# 
+
     #get data from all WindowsServices_*.csv files exported from OTS/SGPCN/PMCS/DMZ 
     $directory = Get-ChildItem -File -Filter $fileFilter -Path $ImportDirectoryName
     $fileDirectory = $directory | Select-Object -ExpandProperty Fullname
@@ -491,11 +520,11 @@ if($CMSServer -ne $env:COMPUTERNAME){
     Move-Item -path "$ImportDirectoryName$fileFilter" -Destination $OutputDirectoryName 
     Get-ChildItem -File -Filter $fileFilter -Path $OutputDirectoryName | Rename-Item -NewName {$_.BaseName+ '_' + $currentTime + $_.Extension -replace 'WindowsServices', 'WS' }
     Write-Log -Message " $($importAll.Count) Services info file has been moved" -NoConsoleOut -Path $LogPath
-    $importAll | Export-Csv -Path "C:\CMS\Reports\WindowsServices_$currentTime.xlsx"
+    $importAll | Export-Csv -Path "C:\CMS\Reports\WindowsServices_$currentTime.csv"
     #move csv files to C:\CMS\Output\ServicesInfo with changed name - WS_<DomainName>_<currenttime>.csv - to keep for additional info
     Write-Log -Message " $($importAll.Count) Services info file has been exported to the report folder" -NoConsoleOut -Path $LogPath
-
-  try{
+  
+ try{
     #loop the imported data from the result of scriptblock
     foreach ($d in $importFiles){
 
@@ -518,13 +547,67 @@ if($CMSServer -ne $env:COMPUTERNAME){
 
         Write-Log -Message "Service $($d.ServiceName) in $($d.Computer) has been inserted" -NoConsoleOut -Path $LogPath
         
+        }
+    }
+    catch{
+        $colComputers = "ERROR"  
+        $ex = $_.Exception
+        write-log -Level Error -Message "$ex  "  -NoConsoleOut -Path $LogPath 
+        Write-Log -Level Error -Message "Failed to push data" -NoConsoleOut -Path $LogPath
+    }
+#------------------------*END WindowsServices*--------------------------------------------# 
+
+
+   
+#----------------------*Windows Scheduled tasks*-----------------------------------#    
+
+    #get data from all WindowsServices_*.csv files exported from OTS/SGPCN/PMCS/DMZ 
+    $taskdirectory = Get-ChildItem -File -Filter $fileTaskFilter -Path $ImportDirectoryName
+    $taskfileDirectory = $taskdirectory | Select-Object -ExpandProperty Fullname
+    $importAllTask = $taskfileDirectory | Import-Csv
+
+    #import files which have problems with check
+    $importTaskFiles = $importAllTask  | Where-Object  {$_.AllPass -ne '1'}
+    Write-Log -Message "Imported $($importTaskFiles.Count) scheduled tasks from the WindowsTasks csv file" -NoConsoleOut -Path $LogPath
+    #move csv files to C:\CMS\Output\ServicesInfo with changed name - WS_<DomainName>_<currenttime>.csv - to keep for additional info
+    Move-Item -path "$ImportDirectoryName$fileTaskFilter" -Destination $OutputDirectoryName 
+    Get-ChildItem -File -Filter $fileTaskFilter -Path $OutputDirectoryName | Rename-Item -NewName {$_.BaseName+ '_' + $currentTime + $_.Extension -replace 'WindowsTasks', 'WST' }
+    Write-Log -Message " $($importAllTask.Count) Scheduled tasks info file has been moved" -NoConsoleOut -Path $LogPath
+    $importAllTask | Export-Csv -Path "C:\CMS\Reports\WindowsTasks_$currentTime.csv"
+    Write-Log -Message " $($importAllTask.Count) Scheduled tasks info file has been exported to the report folder" -NoConsoleOut -Path $LogPath
+  
+  try{
+    #loop the imported data from the result of scriptblock
+    foreach ($d in $importTaskFiles){
+
+        #if the record doesn't exist in DB table then need to insert, else just need to update. Checks by servicename and servername 
+        $sqlCommand = $null
+        $sqlCommand = [string]::Format("MERGE INTO [SchdldTaskPermission] As Target
+                USING (SELECT '{2}' AS TaskName, '{1}' AS ServerName) AS Source 
+                    ON Target.TaskName = Source.TaskName 
+                    AND Target.ServerName = Source.ServerName
+                    WHEN MATCHED THEN 
+                        UPDATE SET  [ExePath] = '{5}', [FileExecPass] = '{6}',[FolderPass] = '{7}',[AllPass] = '{8}',[Comments] = '{9}', ScanDate = GETDATE()
+                    WHEN NOT MATCHED BY TARGET THEN 
+                        INSERT ([ServerID],[Domain],[ServerName],[TaskName],[Description],[TaskState],[ExePath],[FileExecPass],[FolderPass],[AllPass],[Comments])
+	    		VALUES 
+                ((SELECT ID FROM [CentralDB].[Svr].[Inventory] WHERE [Active]=1 AND NAME='{1}' ),'{0}','{1}','{2}','{3}','{4}','{5}','{6}','{7}','{8}','{9}');",
+                $d.Domain, $d.Computer, $d.TaskName, (Sanitize-SQLInput -Input $d.Description), $d.State, $d.Executable, $d.ExecPass, $d.FolderPass, $d.AllPass, $d.Comments
+            )
+
+        Invoke-Sqlcmd -ServerInstance $CMSServer -Database $env:CentralDB -Query $sqlCommand
+
+        Write-Log -Message "Task $($d.TaskName) in $($d.Computer) has been inserted" -NoConsoleOut -Path $LogPath
+        
     }}
         catch
         {$colComputers = "ERROR"  
     $ex = $_.Exception
     write-log -Level Error -Message "$ex  "  -NoConsoleOut -Path $LogPath 
     Write-Log -Level Error -Message "Failed to push data" -NoConsoleOut -Path $LogPath
-    }}
+    }
+#----------------------*END Windows Scheduled tasks*-----------------------------------#       
+}
 else{
         #this is for ECS/OTS/PMCS/DMZ domains
         #Export $returnValue into C:\CMS\Output with name starting as WindowsShares_ 
